@@ -35,14 +35,14 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller (no console)
         shell: powershell
         run: |
-          # Use the provided spec if present, otherwise build from scanner.py
+          # Build a windowed/no-console EXE. If a spec exists, pass the no-console flag; otherwise build from scanner.py
           if (Test-Path scanner.spec) {
-            pyinstaller --clean --noconfirm scanner.spec
+            pyinstaller --clean --noconfirm --noconsole scanner.spec
           } else {
-            pyinstaller --clean --noconfirm --onefile scanner.py
+            pyinstaller --clean --noconfirm --onefile --noconsole scanner.py
           }
 
       - name: Package output

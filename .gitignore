@@ -2,3 +2,5 @@
 /dist
 scanner.spec
 scanner_dbg.spec
+*.pyc
+__pycache__/

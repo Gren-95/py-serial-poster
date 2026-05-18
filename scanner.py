@@ -53,6 +53,10 @@ class Config:
     log_dir: str
     tray: bool
     value_len: int  # <-- NEW
+    dtr: bool
+    rts: bool
+    dump_serial: bool
+    flush_timeout: float
 
 
 def setup_logging(log_dir: str):
@@ -86,7 +90,7 @@ def now_monotonic() -> float:
 
 def list_serial_ports() -> List[Tuple[str, str]]:
     """
-    Returns list of (device, label), e.g. ("COM4", "COM4 - USB Serial Device").
+    Returns list of (device, label), e.g. ("COM5", "COM5 - USB Serial Device").
     """
     ports: List[Tuple[str, str]] = []
     for p in list_ports.comports():
@@ -570,12 +574,36 @@ def serial_reader(cfg: Config, q: "queue.Queue[Tuple[str, float]]"):
 
                 with serial.Serial(cfg.port, cfg.baud, timeout=cfg.read_timeout) as ser:
                     logging.info("Serial port opened (%s).", cfg.port)
+                    try:
+                        settings = ser.get_settings()
+                    except Exception:
+                        settings = "(unavailable)"
+                    logging.info("Serial settings: %s", settings)
+                    try:
+                        logging.debug("Initial in_waiting=%s", ser.in_waiting)
+                    except Exception:
+                        pass
+
+                    # Honor optional control line flags (some devices require DTR/RTS asserted)
+                    if cfg.dtr:
+                        try:
+                            ser.setDTR(True)
+                            logging.info("Set DTR=True for %s", cfg.port)
+                        except Exception as e:
+                            logging.warning("Failed to set DTR: %s", e)
+                    if cfg.rts:
+                        try:
+                            ser.setRTS(True)
+                            logging.info("Set RTS=True for %s", cfg.port)
+                        except Exception as e:
+                            logging.warning("Failed to set RTS: %s", e)
                     with status_lock:
                         status["state"] = f"Connected {cfg.port} @ {cfg.baud}"
                         status["connected"] = True
                         status["last_error"] = ""
 
                     buffer = b""
+                    last_chunk_ts = time.time()
                     while not stop_event.is_set():
                         if port_change_event.is_set():
                             logging.info("Port change requested, reconnecting to %s...", cfg.port)
@@ -584,7 +612,22 @@ def serial_reader(cfg: Config, q: "queue.Queue[Tuple[str, float]]"):
 
                         chunk = ser.read(256)
                         if chunk:
+                            last_chunk_ts = time.time()
+                            logging.debug("Serial chunk (%d bytes) from %s: %r", len(chunk), cfg.port, chunk)
+                            if cfg.dump_serial:
+                                try:
+                                    logging.info("Serial HEX from %s: %s", cfg.port, chunk.hex())
+                                except Exception:
+                                    pass
                             buffer += chunk
+
+                            # Debug: show a short view of the buffer when it grows
+                            if len(buffer) > 0:
+                                logging.debug(
+                                    "Buffer %d bytes (tail 200): %r",
+                                    len(buffer),
+                                    buffer[-200:]
+                                )
 
                             while b"\n" in buffer:
                                 line, buffer = buffer.split(b"\n", 1)
@@ -598,7 +641,12 @@ def serial_reader(cfg: Config, q: "queue.Queue[Tuple[str, float]]"):
                                     continue
                                 last_process_t = t
 
-                                value = line.decode("utf-8", errors="replace").strip()
+                                # Show raw bytes and decoded value for debugging
+                                try:
+                                    value = line.decode("utf-8", errors="replace").strip()
+                                except Exception:
+                                    value = ""
+                                logging.debug("Raw line bytes=%r decoded=%r", line, value)
                                 if not value:
                                     continue
 
@@ -626,6 +674,37 @@ def serial_reader(cfg: Config, q: "queue.Queue[Tuple[str, float]]"):
                                 except queue.Full:
                                     logging.warning("Queue full; dropped value=%r", value)
                         else:
+                            # No new bytes read. If buffer has partial data and flush_timeout elapsed, process it.
+                            if buffer and cfg.flush_timeout > 0 and (time.time() - last_chunk_ts) >= cfg.flush_timeout:
+                                logging.info("Flush timeout reached; processing partial buffer (%d bytes)", len(buffer))
+                                line = buffer
+                                buffer = b""
+
+                                t = now_monotonic()
+                                if t - last_process_t >= min_interval:
+                                    last_process_t = t
+                                    try:
+                                        value = line.decode("utf-8", errors="replace").strip()
+                                    except Exception:
+                                        value = ""
+                                    logging.debug("Flushed raw bytes=%r decoded=%r", line, value)
+                                    if value:
+                                        if cfg.value_len > 0 and len(value) != cfg.value_len:
+                                            logging.debug(
+                                                "Ignored flushed value (len=%d, expected=%d): %r",
+                                                len(value), cfg.value_len, value
+                                            )
+                                        else:
+                                            with status_lock:
+                                                status["last_value"] = value
+
+                                            if not dedupe.is_duplicate(value):
+                                                dedupe.record(value, cfg.port)
+                                                try:
+                                                    q.put_nowait((value, t))
+                                                    logging.info("Enqueued flushed value=%r", value)
+                                                except queue.Full:
+                                                    logging.warning("Queue full; dropped flushed value=%r", value)
                             time.sleep(0.01)
 
             except serial.SerialException as e:
@@ -661,11 +740,11 @@ def parse_args() -> Config:
         description="COM scanner with log-based de-duplication, normal POST, tray port picker + length filter"
     )
 
-    p.add_argument("--port", default="COM4", help="Serial port (default: COM4)")
+    p.add_argument("--port", default="COM5", help="Serial port (default: COM5)")
     p.add_argument("--baud", type=int, default=9600, help="Baud rate (default: 9600)")
     p.add_argument("--read-timeout", type=float, default=0.05, help="Serial read timeout seconds (default: 0.05)")
     p.add_argument("--scan-hz-cap", type=float, default=10.0, help="Max processing rate Hz (default: 10)")
-    p.add_argument("--dedupe-sec", type=int, default=60, help="De-duplication window seconds (default: 60)")
+    p.add_argument("--dedupe-sec", type=int, default=3600, help="De-duplication window seconds (default: 3600)")
 
     # NEW: expected scan value length
     p.add_argument(
@@ -674,6 +753,11 @@ def parse_args() -> Config:
         default=12,
         help="Expected scan value length (default: 12). Use 0 to disable length check.",
     )
+
+    p.add_argument("--dtr", action="store_true", help="Assert DTR after opening serial port")
+    p.add_argument("--rts", action="store_true", help="Assert RTS after opening serial port")
+    p.add_argument("--dump-serial", action="store_true", help="Continuously dump raw serial data as HEX (diagnostic)")
+    p.add_argument("--flush-timeout", type=float, default=0.25, help="Flush buffer after this many seconds of no data (0 to disable, default 0.25)")
 
     p.add_argument(
         "--endpoint",
@@ -706,6 +790,10 @@ def parse_args() -> Config:
         log_dir=args.log_dir,
         tray=(not args.no_tray),
         value_len=args.value_len,
+        dtr=args.dtr,
+        rts=args.rts,
+        dump_serial=args.dump_serial,
+        flush_timeout=args.flush_timeout,
     )
 
 

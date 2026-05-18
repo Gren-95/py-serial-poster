@@ -38,9 +38,9 @@ jobs:
       - name: Build with PyInstaller (no console)
         shell: powershell
         run: |
-          # Build a windowed/no-console EXE. If a spec exists, pass the no-console flag; otherwise build from scanner.py
+          # Build a windowed/no-console EXE. The checked-in spec locks console=False; fallback keeps the same behavior.
           if (Test-Path scanner.spec) {
-            pyinstaller --clean --noconfirm --noconsole scanner.spec
+            pyinstaller --clean --noconfirm scanner.spec
           } else {
             pyinstaller --clean --noconfirm --onefile --noconsole scanner.py
           }

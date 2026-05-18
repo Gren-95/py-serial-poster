@@ -39,8 +39,8 @@ Logs and dedupe files
 
 Build (no console window)
 
-To produce a single-file Windows EXE with no console window (windowed):
+To produce a single-file Windows EXE with no console window (windowed), build from the checked-in spec:
 
 ```powershell
-python -m PyInstaller --clean --noconfirm --onefile --noconsole --name scanner scanner.py
+python -m PyInstaller --clean --noconfirm scanner.spec
 ```

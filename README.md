@@ -44,11 +44,3 @@ To produce a single-file Windows EXE with no console window (windowed):
 ```powershell
 python -m PyInstaller --clean --noconfirm --onefile --noconsole --name scanner scanner.py
 ```
-
-Notes on CI
-- The repository includes a GitHub Actions workflow that builds the EXE and
-	uploads a ZIP artifact to a GitHub Release when you push a `v*` tag.
-
-If you want me to build and test the EXE locally on this machine, say so and
-I'll download the release asset and verify it runs headless.
-

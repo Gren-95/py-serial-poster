@@ -34,6 +34,8 @@ status = {
     "last_error": "",
     "posts_ok": 0,
     "posts_fail": 0,
+    "duplicates": 0,
+    "invalid": 0,
 }
 
 
@@ -57,6 +59,7 @@ class Config:
     rts: bool
     dump_serial: bool
     flush_timeout: float
+    allowed_prefixes: List[str]
 
 
 def setup_logging(log_dir: str):
@@ -292,12 +295,67 @@ class LogDedupe:
         logging.info("LogDedupe warmed: %d values in last %ds", len(self._recent), self.window_sec)
 
     def is_duplicate(self, value: str) -> bool:
+        # Lightweight duplicate check:
+        # 1) Check in-memory recent index (fast)
+        # 2) If not present, scan tail of today's (and yesterday's if needed) log files
+        #    for a matching value within the dedupe window (cheap compared to full re-warm).
         self._rotate_files_if_needed()
         self._prune_recent()
 
         now_ts = self._local_now().timestamp()
         last = self._recent.get(value)
-        return last is not None and (now_ts - last) < self.window_sec
+        if last is not None and (now_ts - last) < self.window_sec:
+            return True
+
+        # Perform a lightweight scan of recent log lines for this value.
+        try:
+            found_ts = self._scan_value_in_logs(value)
+            if found_ts is not None:
+                # Cache the discovery in memory for faster future checks
+                self._recent[value] = found_ts
+                return True
+        except Exception:
+            # On any error, fall back to in-memory behavior (already checked)
+            pass
+
+        return False
+
+    def _scan_value_in_logs(self, value: str) -> Optional[float]:
+        """
+        Scan the tail of today's (and yesterday's if window crosses midnight) log files
+        for a line that contains `value` and whose timestamp is within the dedupe window.
+        Returns the found timestamp (epoch seconds) or None.
+        """
+        now = self._local_now()
+        cutoff_ts = (now - timedelta(seconds=self.window_sec)).timestamp()
+
+        # Helper to scan a path's tail lines for the value
+        def scan_path(path: Path) -> Optional[float]:
+            for line in reversed(self._read_tail_lines(path)):
+                ts, val = self._parse_line(line)
+                if ts is None:
+                    continue
+                if ts < cutoff_ts:
+                    break
+                if val and val == value:
+                    return ts
+            return None
+
+        # Today
+        today_path = self._day_log_path(now)
+        ts = scan_path(today_path)
+        if ts is not None:
+            return ts
+
+        # Yesterday if needed
+        window_start = now - timedelta(seconds=self.window_sec)
+        if window_start.date() != now.date():
+            y_path = self._day_log_path(window_start)
+            ts = scan_path(y_path)
+            if ts is not None:
+                return ts
+
+        return None
 
     def record(self, value: str, port: str):
         """
@@ -333,9 +391,11 @@ def tray_title(cfg: Config) -> str:
         fail = status["posts_fail"]
         err = status["last_error"]
         conn = status["connected"]
+        dup = status.get("duplicates", 0)
+        inv = status.get("invalid", 0)
 
     exp = cfg.value_len if cfg.value_len > 0 else "off"
-    t = f"Scanner: {s}\nPort: {cfg.port} ({'OK' if conn else 'NO'})\nLen: {exp}\nOK: {ok}  Fail: {fail}"
+    t = f"Scanner: {s}\nPort: {cfg.port} ({'OK' if conn else 'NO'})\nLen: {exp}\nOK: {ok}  Fail: {fail}  Dup: {dup}  Invalid: {inv}"
     if last:
         t += f"\nLast: {last}"
     if err:
@@ -348,11 +408,18 @@ def tray_color() -> Tuple[int, int, int]:
         connected = status.get("connected", False)
         err = status.get("last_error", "")
         st = status.get("state", "")
+        dup = status.get("duplicates", 0)
+        inv = status.get("invalid", 0)
+        ok = status.get("posts_ok", 0)
+
+    # Priority: error (red) -> success (green) -> invalid/duplicate (orange) -> connected/no-success (white)
     if err:
         return (220, 0, 0)
-    if not connected or "Reconnecting" in st or "Connecting" in st or "Switching" in st:
+    if ok > 0:
+        return (0, 200, 0)
+    if dup > 0 or inv > 0:
         return (255, 180, 0)
-    return (0, 200, 0)
+    return (255, 255, 255)
 
 
 def pick_port_tk(current_port: str) -> Optional[str]:
@@ -656,6 +723,15 @@ def serial_reader(cfg: Config, q: "queue.Queue[Tuple[str, float]]"):
                                         "Ignored value (len=%d, expected=%d): %r",
                                         len(value), cfg.value_len, value
                                     )
+                                    with status_lock:
+                                        status["invalid"] += 1
+                                    continue
+
+                                # Prefix whitelist (if provided)
+                                if cfg.allowed_prefixes and not any(value.startswith(pref) for pref in cfg.allowed_prefixes):
+                                    logging.debug("Ignored value due to prefix mismatch: %r", value)
+                                    with status_lock:
+                                        status["invalid"] += 1
                                     continue
 
                                 with status_lock:
@@ -663,6 +739,8 @@ def serial_reader(cfg: Config, q: "queue.Queue[Tuple[str, float]]"):
 
                                 if dedupe.is_duplicate(value):
                                     logging.debug("Duplicate ignored value=%r", value)
+                                    with status_lock:
+                                        status["duplicates"] += 1
                                     continue
 
                                 # Record WITH COM port
@@ -694,17 +772,27 @@ def serial_reader(cfg: Config, q: "queue.Queue[Tuple[str, float]]"):
                                                 "Ignored flushed value (len=%d, expected=%d): %r",
                                                 len(value), cfg.value_len, value
                                             )
-                                        else:
                                             with status_lock:
-                                                status["last_value"] = value
-
-                                            if not dedupe.is_duplicate(value):
-                                                dedupe.record(value, cfg.port)
-                                                try:
-                                                    q.put_nowait((value, t))
-                                                    logging.info("Enqueued flushed value=%r", value)
-                                                except queue.Full:
-                                                    logging.warning("Queue full; dropped flushed value=%r", value)
+                                                status["invalid"] += 1
+                                        else:
+                                            # Prefix whitelist (if provided)
+                                            if cfg.allowed_prefixes and not any(value.startswith(pref) for pref in cfg.allowed_prefixes):
+                                                logging.debug("Ignored flushed value due to prefix mismatch: %r", value)
+                                                with status_lock:
+                                                    status["invalid"] += 1
+                                            else:
+                                                with status_lock:
+                                                    status["last_value"] = value
+                                                if not dedupe.is_duplicate(value):
+                                                    dedupe.record(value, cfg.port)
+                                                    try:
+                                                        q.put_nowait((value, t))
+                                                        logging.info("Enqueued flushed value=%r", value)
+                                                    except queue.Full:
+                                                        logging.warning("Queue full; dropped flushed value=%r", value)
+                                                else:
+                                                    with status_lock:
+                                                        status["duplicates"] += 1
                             time.sleep(0.01)
 
             except serial.SerialException as e:
@@ -758,6 +846,11 @@ def parse_args() -> Config:
     p.add_argument("--rts", action="store_true", help="Assert RTS after opening serial port")
     p.add_argument("--dump-serial", action="store_true", help="Continuously dump raw serial data as HEX (diagnostic)")
     p.add_argument("--flush-timeout", type=float, default=0.25, help="Flush buffer after this many seconds of no data (0 to disable, default 0.25)")
+    p.add_argument(
+        "--allowed-prefixes",
+        default="126,226",
+        help="Comma-separated list of allowed prefixes for values (e.g. 126,226). If omitted, any prefix is allowed.",
+    )
 
     p.add_argument(
         "--endpoint",
@@ -794,6 +887,7 @@ def parse_args() -> Config:
         rts=args.rts,
         dump_serial=args.dump_serial,
         flush_timeout=args.flush_timeout,
+        allowed_prefixes=[p.strip() for p in args.allowed_prefixes.split(",")] if args.allowed_prefixes else [],
     )
 
 
